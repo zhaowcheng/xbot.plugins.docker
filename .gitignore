@@ -1,1 +1,12 @@
+__pycache__/
+*.py[cod]
+*$py.class
+.vscode/*
+.idea/*
 .worktrees/
+build/
+*.egg-info/
+dist/
+venv/
+testproj/
+.DS_Store

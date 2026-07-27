@@ -1,0 +1,38 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "xbot.plugins.docker"
+description = "Docker library for xbot.framework"
+authors = [
+    { name = "zhaowcheng", email = "zhaowcheng@163.com" },
+]
+license = "BSD-2-Clause"
+license-files = ["LICENSE"]
+requires-python = ">=3.10"
+dependencies = [
+    "xbot.framework>=0.5.1",
+    "docker",
+]
+classifiers = [
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+]
+dynamic = ["version", "readme"]
+
+[project.urls]
+Homepage = "https://github.com/zhaowcheng/xbot.plugins.docker"
+Issues = "https://github.com/zhaowcheng/xbot.plugins.docker/issues"
+
+[tool.setuptools.dynamic]
+version = { attr = "xbot.plugins.docker.version.__version__" }
+
+[tool.setuptools.packages.find]
+include = ["xbot.plugins.docker*", "tests*"]
+
+[tool.setuptools.package-data]
+"xbot.plugins.docker" = ["py.typed"]
