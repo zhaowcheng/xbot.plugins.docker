@@ -3,7 +3,11 @@ Test Docker module helpers.
 """
 
 import doctest
+import io
+import tarfile
+import tempfile
 import unittest
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 from docker.errors import DockerException
@@ -93,6 +97,7 @@ class TestDockerConnection(unittest.TestCase):
         existing.status = 'running'
         existing.name = 'existing'
         existing.id = 'existing-id'
+        self.container = existing
         created = self.client.containers.run.return_value
         created.status = 'running'
         created.name = 'created-container'
@@ -331,6 +336,317 @@ class TestDockerConnection(unittest.TestCase):
 
         self.assertEqual(result.cmd, 'cd /tmp && pwd')
         self.assertEqual(self.conn._cwd, '')
+
+    @staticmethod
+    def create_archive(members: dict[str, bytes]) -> bytes:
+        """
+        Create a tar archive for download tests.
+
+        :param members: Archive member contents by name.
+        :return: Uncompressed tar archive data.
+        """
+        stream = io.BytesIO()
+        with tarfile.open(fileobj=stream, mode='w') as archive:
+            for name, content in members.items():
+                info = tarfile.TarInfo(name)
+                info.size = len(content)
+                archive.addfile(info, io.BytesIO(content))
+        return stream.getvalue()
+
+    def test_posix_path_helpers(self) -> None:
+        """
+        Test container path helpers use POSIX semantics.
+
+        :return: None.
+        """
+        self.assertEqual(self.conn.join('/tmp', 'a', 'file'), '/tmp/a/file')
+        self.assertEqual(self.conn.normpath('/tmp/a/../b/'), '/tmp/b')
+        self.assertEqual(self.conn.basename('/tmp/b/file'), 'file')
+
+    def test_exists_returns_command_status(self) -> None:
+        """
+        Test exists returns whether the command reports a path.
+
+        :return: None.
+        """
+        self.conn = self.create_connected_connection()
+        self.configure_exec(output=b'', rc=1)
+
+        self.assertFalse(self.conn.exists('/tmp/missing'))
+
+    def test_makedirs_uses_quoted_recursive_command(self) -> None:
+        """
+        Test makedirs creates a container directory recursively.
+
+        :return: None.
+        """
+        self.conn = self.create_connected_connection()
+        self.configure_exec(output=b'', rc=0)
+
+        self.conn.makedirs('/tmp/a path')
+
+        self.client.api.exec_create.assert_called_once_with(
+            self.container.id,
+            ['/bin/sh', '-c', "mkdir -p -- '/tmp/a path'"],
+            stdout=True,
+            stderr=True,
+            stdin=False,
+            tty=True,
+            environment={
+                'LANG': 'C.UTF-8',
+                'LANGUAGE': 'en_US.UTF-8',
+            },
+            user=None,
+        )
+
+    def test_get_owner_caches_container_identity(self) -> None:
+        """
+        Test container owner IDs are looked up once per connection.
+
+        :return: None.
+        """
+        self.conn = self.create_connected_connection()
+        with patch.object(
+            self.conn,
+            'exec',
+            side_effect=[DockerCommandResult('1000'), DockerCommandResult('1001')],
+        ) as execute:
+            self.assertEqual(self.conn._get_owner(), (1000, 1001))
+            self.assertEqual(self.conn._get_owner(), (1000, 1001))
+
+        self.assertEqual(execute.call_count, 2)
+        execute.assert_has_calls([unittest.mock.call('id -u'), unittest.mock.call('id -g')])
+
+    def test_getfile_extracts_remote_basename(self) -> None:
+        """
+        Test getfile extracts a downloaded file using its remote basename.
+
+        :return: None.
+        """
+        self.conn = self.create_connected_connection()
+        self.container.get_archive.return_value = (
+            iter([self.create_archive({'source': b'content'})]),
+            {},
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            self.conn.getfile('/tmp/source', directory)
+
+            self.assertEqual(
+                Path(directory, 'source').read_bytes(),
+                b'content',
+            )
+
+    def test_getfile_renames_download(self) -> None:
+        """
+        Test getfile renames a downloaded file when requested.
+
+        :return: None.
+        """
+        self.conn = self.create_connected_connection()
+        self.container.get_archive.return_value = (
+            iter([self.create_archive({'source': b'content'})]),
+            {},
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            self.conn.getfile('/tmp/source', directory, filename='renamed')
+
+            self.assertEqual(
+                Path(directory, 'renamed').read_bytes(),
+                b'content',
+            )
+
+    def test_getdir_keeps_top_level_directory(self) -> None:
+        """
+        Test getdir preserves the remote directory basename locally.
+
+        :return: None.
+        """
+        self.conn = self.create_connected_connection()
+        self.container.get_archive.return_value = (
+            iter([self.create_archive({'tree/nested/file.txt': b'content'})]),
+            {},
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            self.conn.getdir('/tmp/tree', directory)
+
+            self.assertEqual(
+                Path(directory, 'tree', 'nested', 'file.txt').read_bytes(),
+                b'content',
+            )
+
+    def test_getfile_propagates_unopened_connection_error(self) -> None:
+        """
+        Test getfile preserves the public unopened connection error.
+
+        :return: None.
+        """
+        with tempfile.TemporaryDirectory() as directory:
+            with self.assertRaisesRegex(
+                DockerConnectError,
+                'Docker connection is not open.',
+            ):
+                self.conn.getfile('/tmp/source', directory)
+
+    def test_getfile_requires_existing_local_destination(self) -> None:
+        """
+        Test getfile does not create a missing local destination directory.
+
+        :return: None.
+        """
+        self.conn = self.create_connected_connection()
+        self.container.get_archive.return_value = (
+            iter([self.create_archive({'source': b'content'})]),
+            {},
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            missing = Path(directory, 'missing')
+            with self.assertRaises(FileNotFoundError):
+                self.conn.getfile('/tmp/source', str(missing))
+
+        self.assertFalse(missing.exists())
+
+    def test_getdir_requires_existing_local_destination(self) -> None:
+        """
+        Test getdir does not create a missing local destination directory.
+
+        :return: None.
+        """
+        self.conn = self.create_connected_connection()
+        self.container.get_archive.return_value = (
+            iter([self.create_archive({'tree/file.txt': b'content'})]),
+            {},
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            missing = Path(directory, 'missing')
+            with self.assertRaises(FileNotFoundError):
+                self.conn.getdir('/tmp/tree', str(missing))
+
+        self.assertFalse(missing.exists())
+
+    def test_getfile_propagates_docker_error(self) -> None:
+        """
+        Test getfile does not wrap Docker archive errors.
+
+        :return: None.
+        """
+        self.conn = self.create_connected_connection()
+        error = DockerException('download failed')
+        self.container.get_archive.side_effect = error
+        with tempfile.TemporaryDirectory() as directory:
+            with self.assertRaises(DockerException) as caught:
+                self.conn.getfile('/tmp/source', directory)
+
+        self.assertIs(caught.exception, error)
+
+    def test_putfile_archives_local_basename_with_owner(self) -> None:
+        """
+        Test putfile archives a file at its basename with container ownership.
+
+        :return: None.
+        """
+        self.conn = self.create_connected_connection()
+        self.conn._uid = 1000
+        self.conn._gid = 1000
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory, 'source.txt')
+            source.write_bytes(b'content')
+            with patch.object(self.conn, 'exists', return_value=True):
+                self.conn.putfile(str(source), '/tmp')
+
+        stream = self.container.put_archive.call_args.args[1]
+        stream.seek(0)
+        with tarfile.open(fileobj=stream, mode='r') as archive:
+            members = archive.getmembers()
+        self.assertEqual(members[0].name, 'source.txt')
+        self.assertTrue(all(member.uid == 1000 for member in members))
+        self.assertTrue(all(member.gid == 1000 for member in members))
+        self.assertEqual(self.container.put_archive.call_args.args[0], '/tmp')
+
+    def test_putfile_uses_requested_archive_name(self) -> None:
+        """
+        Test putfile uses a requested archive name.
+
+        :return: None.
+        """
+        self.conn = self.create_connected_connection()
+        self.conn._uid = 1000
+        self.conn._gid = 1000
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory, 'source.txt')
+            source.write_bytes(b'content')
+            with patch.object(self.conn, 'exists', return_value=True):
+                self.conn.putfile(str(source), '/tmp', filename='renamed')
+
+        stream = self.container.put_archive.call_args.args[1]
+        stream.seek(0)
+        with tarfile.open(fileobj=stream, mode='r') as archive:
+            self.assertEqual(archive.getmembers()[0].name, 'renamed')
+
+    def test_putdir_archives_top_level_directory_with_owner(self) -> None:
+        """
+        Test putdir keeps the local directory basename in the archive.
+
+        :return: None.
+        """
+        self.conn = self.create_connected_connection()
+        self.conn._uid = 1000
+        self.conn._gid = 1000
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory, 'tree')
+            source.mkdir()
+            Path(source, 'child.txt').write_bytes(b'content')
+            with patch.object(self.conn, 'exists', return_value=True):
+                self.conn.putdir(str(source), '/tmp')
+
+        stream = self.container.put_archive.call_args.args[1]
+        stream.seek(0)
+        with tarfile.open(fileobj=stream, mode='r') as archive:
+            members = archive.getmembers()
+        self.assertEqual(members[0].name, 'tree')
+        self.assertIn('tree/child.txt', [member.name for member in members])
+        self.assertTrue(all(member.uid == 1000 for member in members))
+        self.assertTrue(all(member.gid == 1000 for member in members))
+
+    def test_putfile_creates_missing_remote_destination(self) -> None:
+        """
+        Test putfile creates the destination before uploading.
+
+        :return: None.
+        """
+        self.conn = self.create_connected_connection()
+        self.conn._uid = 1000
+        self.conn._gid = 1000
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory, 'source.txt')
+            source.write_bytes(b'content')
+            with (
+                patch.object(self.conn, 'exists', return_value=False),
+                patch.object(self.conn, 'makedirs') as makedirs,
+            ):
+                self.conn.putfile(str(source), '/missing')
+
+        makedirs.assert_called_once_with('/missing')
+        self.assertEqual(self.container.put_archive.call_args.args[0], '/missing')
+
+    def test_putfile_propagates_docker_error(self) -> None:
+        """
+        Test putfile does not wrap Docker archive errors.
+
+        :return: None.
+        """
+        self.conn = self.create_connected_connection()
+        self.conn._uid = 1000
+        self.conn._gid = 1000
+        error = DockerException('upload failed')
+        self.container.put_archive.side_effect = error
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory, 'source.txt')
+            source.write_bytes(b'content')
+            with patch.object(self.conn, 'exists', return_value=True):
+                with self.assertRaises(DockerException) as caught:
+                    self.conn.putfile(str(source), '/tmp')
+
+        self.assertIs(caught.exception, error)
 
     def test_exec_timeout_closes_socket_and_reports_partial_output(
         self,

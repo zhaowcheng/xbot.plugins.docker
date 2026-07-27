@@ -2,7 +2,11 @@
 Docker module.
 """
 
+import io
+import os
+import posixpath
 import shlex
+import tarfile
 import threading
 import time
 from contextlib import contextmanager
@@ -402,6 +406,194 @@ class DockerConnection:
             f'ReturnCode: {result.rc}\n'
             f'Output:\n{result}'
         )
+
+    def join(self, *paths: str) -> str:
+        """
+        Join container paths using POSIX semantics.
+
+        :param paths: Path components.
+        :return: Joined container path.
+        """
+        return posixpath.join(*paths)
+
+    def normpath(self, path: str) -> str:
+        """
+        Normalize a container path using POSIX semantics.
+
+        :param path: Container path.
+        :return: Normalized container path.
+        """
+        return posixpath.normpath(path)
+
+    def basename(self, path: str) -> str:
+        """
+        Return the final component of a container path.
+
+        :param path: Container path.
+        :return: Final path component.
+        """
+        return posixpath.basename(path)
+
+    def exists(self, path: str) -> bool:
+        """
+        Check whether a container path exists.
+
+        :param path: Container path.
+        :return: True when the path exists.
+        """
+        result = self.exec(
+            f'test -e {shlex.quote(path)}',
+            expect=None,
+        )
+        return result.rc == 0
+
+    def makedirs(self, path: str) -> None:
+        """
+        Create a container directory and its parents.
+
+        :param path: Container directory path.
+        :return: None.
+        """
+        self.exec(f'mkdir -p -- {shlex.quote(path)}')
+
+    def _get_owner(self) -> tuple[int, int]:
+        """
+        Return the connected container user and group IDs.
+
+        :return: Container user and group IDs.
+        """
+        if self._uid is None or self._gid is None:
+            self._uid = int(self.exec('id -u'))
+            self._gid = int(self.exec('id -g'))
+        return self._uid, self._gid
+
+    def getfile(
+        self,
+        rfile: str,
+        ldir: str,
+        filename: str | None = None,
+    ) -> None:
+        """
+        Download a container file into an existing local directory.
+
+        :param rfile: Container file path.
+        :param ldir: Existing local destination directory.
+        :param filename: Optional local destination filename.
+        :return: None.
+        """
+        container = self._container_resource()
+        if not os.path.exists(ldir):
+            raise FileNotFoundError(ldir)
+        if not os.path.isdir(ldir):
+            raise NotADirectoryError(ldir)
+        stream, _ = container.get_archive(rfile)
+        archive_data = io.BytesIO()
+        for chunk in stream:
+            archive_data.write(chunk)
+        archive_data.seek(0)
+        with tarfile.open(fileobj=archive_data, mode='r') as archive:
+            member = archive.getmembers()[0]
+            archive.extract(member, ldir)
+        if filename is not None:
+            os.replace(
+                os.path.join(ldir, member.name),
+                os.path.join(ldir, filename),
+            )
+
+    def getdir(self, rdir: str, ldir: str) -> None:
+        """
+        Download a container directory into an existing local directory.
+
+        :param rdir: Container directory path.
+        :param ldir: Existing local destination directory.
+        :return: None.
+        """
+        container = self._container_resource()
+        if not os.path.exists(ldir):
+            raise FileNotFoundError(ldir)
+        if not os.path.isdir(ldir):
+            raise NotADirectoryError(ldir)
+        stream, _ = container.get_archive(rdir)
+        archive_data = io.BytesIO()
+        for chunk in stream:
+            archive_data.write(chunk)
+        archive_data.seek(0)
+        with tarfile.open(fileobj=archive_data, mode='r') as archive:
+            archive.extractall(ldir)
+
+    def putfile(
+        self,
+        lfile: str,
+        rdir: str,
+        filename: str | None = None,
+    ) -> None:
+        """
+        Upload a local file into a container directory.
+
+        :param lfile: Local file path.
+        :param rdir: Container destination directory.
+        :param filename: Optional destination filename.
+        :return: None.
+        """
+        container = self._container_resource()
+        uid, gid = self._get_owner()
+
+        def set_owner(tarinfo: tarfile.TarInfo) -> tarfile.TarInfo:
+            """
+            Set archive ownership.
+
+            :param tarinfo: Archive member metadata.
+            :return: Updated archive member metadata.
+            """
+            tarinfo.uid = uid
+            tarinfo.gid = gid
+            return tarinfo
+
+        stream = io.BytesIO()
+        with tarfile.open(fileobj=stream, mode='w') as archive:
+            archive.add(
+                lfile,
+                arcname=filename or os.path.basename(lfile),
+                filter=set_owner,
+            )
+        if not self.exists(rdir):
+            self.makedirs(rdir)
+        stream.seek(0)
+        container.put_archive(rdir, stream)
+
+    def putdir(self, ldir: str, rdir: str) -> None:
+        """
+        Upload a local directory into a container directory.
+
+        :param ldir: Local directory path.
+        :param rdir: Container destination directory.
+        :return: None.
+        """
+        container = self._container_resource()
+        uid, gid = self._get_owner()
+
+        def set_owner(tarinfo: tarfile.TarInfo) -> tarfile.TarInfo:
+            """
+            Set archive ownership.
+
+            :param tarinfo: Archive member metadata.
+            :return: Updated archive member metadata.
+            """
+            tarinfo.uid = uid
+            tarinfo.gid = gid
+            return tarinfo
+
+        stream = io.BytesIO()
+        with tarfile.open(fileobj=stream, mode='w') as archive:
+            archive.add(
+                ldir,
+                arcname=os.path.basename(os.path.normpath(ldir)),
+                filter=set_owner,
+            )
+        if not self.exists(rdir):
+            self.makedirs(rdir)
+        stream.seek(0)
+        container.put_archive(rdir, stream)
 
     @contextmanager
     def cd(self, path: str) -> Generator[None, None, None]:
