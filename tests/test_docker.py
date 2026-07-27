@@ -16,6 +16,7 @@ from unittest.mock import MagicMock, patch
 
 from docker import DockerClient
 from docker.errors import DockerException, NotFound
+from docker.models.containers import Container
 from docker.tls import TLSConfig
 
 from xbot.plugins.docker import docker
@@ -775,7 +776,7 @@ class TestDockerConnection(unittest.TestCase):
 
         :return: None.
         """
-        runargs = {'command': 'sleep 60'}
+        runargs: dict[str, object] = {'command': 'sleep 60'}
 
         self.conn.connect('127.0.0.1', image='alpine:latest', runargs=runargs)
 
@@ -919,7 +920,7 @@ class TestDockerIntegration(unittest.TestCase):
 
     client: DockerClient
     fixture_name: str
-    fixture: object
+    fixture: Container
     local_root: Path
 
     @classmethod

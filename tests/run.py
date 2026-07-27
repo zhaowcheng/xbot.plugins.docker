@@ -62,7 +62,7 @@ def main() -> int:
     args = create_parser().parse_args()
     configure_integration_tests(args)
     startdir = Path(__file__).parent
-    suite = unittest.TestLoader().discover(startdir)
+    suite = unittest.TestLoader().discover(str(startdir))
     result = unittest.TextTestRunner(verbosity=2).run(suite)
     return 0 if result.wasSuccessful() else 1
 

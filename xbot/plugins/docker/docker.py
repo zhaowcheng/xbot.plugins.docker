@@ -34,6 +34,9 @@ class DockerCommandResult(str):
     Result of a Docker command.
     """
 
+    __rc: int
+    __cmd: str
+
     def __new__(
         cls: type['DockerCommandResult'],
         out: str,
@@ -332,7 +335,7 @@ class DockerConnection:
         effective_cmd = cmd
         if self._cwd:
             effective_cmd = f'cd {shlex.quote(self._cwd)} && {cmd}'
-        extra = {'hook': {}}
+        extra: dict[str, dict[str, DockerCommandResult]] = {'hook': {}}
         self._logger.info(
             f"Command: '{effective_cmd}', Expect: '{expect}'",
             extra=extra,
