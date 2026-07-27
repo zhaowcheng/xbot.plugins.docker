@@ -4,13 +4,13 @@ Test Docker module helpers.
 
 import doctest
 import unittest
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 from docker.errors import DockerException
 
 from xbot.plugins.docker import docker
 from xbot.plugins.docker.docker import DockerCommandResult, DockerConnection
-from xbot.plugins.docker.errors import DockerConnectError
+from xbot.plugins.docker.errors import DockerCommandError, DockerConnectError
 
 
 HOST = ''
@@ -87,6 +87,8 @@ class TestDockerConnection(unittest.TestCase):
         self.client_patch = patch('xbot.plugins.docker.docker.DockerClient')
         self.client_class = self.client_patch.start()
         self.client = self.client_class.return_value
+        self.select_patch = patch('xbot.plugins.docker.docker.select')
+        self.select = self.select_patch.start()
         existing = self.client.containers.get.return_value
         existing.status = 'running'
         existing.name = 'existing'
@@ -104,6 +106,43 @@ class TestDockerConnection(unittest.TestCase):
         :return: None.
         """
         self.client_patch.stop()
+        self.select_patch.stop()
+
+    def create_connected_connection(
+        self,
+        shenvs: dict[str, str] | None = None,
+        user: str | None = None,
+    ) -> DockerConnection:
+        """
+        Create a connection backed by the mocked existing container.
+
+        :param shenvs: Default shell environment variables.
+        :param user: Container command user.
+        :return: Connected Docker connection.
+        """
+        connection = DockerConnection(shenvs=shenvs)
+        connection.connect('127.0.0.1', container='existing', user=user)
+        return connection
+
+    def configure_exec(
+        self,
+        output: bytes,
+        rc: int,
+    ) -> MagicMock:
+        """
+        Configure the Docker API responses for one command execution.
+
+        :param output: Command output received from the socket.
+        :param rc: Command return code.
+        :return: Mocked Docker socket.
+        """
+        socket = MagicMock()
+        socket.recv.side_effect = [output, b'']
+        self.client.api.exec_create.return_value = {'Id': 'exec-id'}
+        self.client.api.exec_start.return_value = socket
+        self.client.api.exec_inspect.return_value = {'ExitCode': rc}
+        self.select.return_value = ([socket], [], [])
+        return socket
 
     def test_connect_requires_exactly_one_target(self) -> None:
         """
@@ -212,7 +251,137 @@ class TestDockerConnection(unittest.TestCase):
 
         self.client.close.assert_called_once_with()
 
-    def test_image_connection_creates_without_pull_or_status_check(self) -> None:
+    def test_exec_uses_shell_user_and_merged_environment(self) -> None:
+        """
+        Test command execution uses the configured shell environment and user.
+
+        :return: None.
+        """
+        self.conn = self.create_connected_connection(
+            shenvs={'LANG': 'C.UTF-8', 'BASE': 'one'},
+            user='xbot',
+        )
+        self.configure_exec(output=b'hello\n', rc=0)
+
+        result = self.conn.exec(
+            'echo hello',
+            shenvs={'BASE': 'two', 'EXTRA': 'three'},
+        )
+
+        self.client.api.exec_create.assert_called_once_with(
+            self.client.containers.get.return_value.id,
+            ['/bin/sh', '-c', 'echo hello'],
+            stdout=True,
+            stderr=True,
+            stdin=False,
+            tty=True,
+            environment={
+                'LANG': 'C.UTF-8',
+                'LANGUAGE': 'en_US.UTF-8',
+                'BASE': 'two',
+                'EXTRA': 'three',
+            },
+            user='xbot',
+        )
+        self.assertEqual(result, 'hello')
+        self.assertEqual(result.rc, 0)
+        self.assertEqual(result.cmd, 'echo hello')
+
+    def test_expect_supports_rc_string_and_none(self) -> None:
+        """
+        Test all supported expectation modes.
+
+        :return: None.
+        """
+        self.conn = self.create_connected_connection()
+        self.configure_exec(output=b'not found\n', rc=2)
+        self.conn.exec('ls /missing', expect=2)
+        self.configure_exec(output=b'hello\n', rc=7)
+        self.conn.exec('echo hello', expect='hello')
+        self.configure_exec(output=b'failed\n', rc=9)
+        self.conn.exec('false', expect=None)
+
+    def test_expect_mismatch_raises_command_error(self) -> None:
+        """
+        Test a mismatched expectation raises a command error.
+
+        :return: None.
+        """
+        self.conn = self.create_connected_connection()
+        self.configure_exec(output=b'hello\n', rc=1)
+
+        with self.assertRaises(DockerCommandError) as context:
+            self.conn.exec('echo hello')
+
+        self.assertIn('Command: echo hello', str(context.exception))
+        self.assertIn('Expect: 0', str(context.exception))
+        self.assertIn('ReturnCode: 1', str(context.exception))
+
+    def test_cd_prefixes_command_and_restores_directory(self) -> None:
+        """
+        Test directory contexts prefix a command and restore the directory.
+
+        :return: None.
+        """
+        self.conn = self.create_connected_connection()
+        self.configure_exec(output=b'/tmp\n', rc=0)
+
+        with self.conn.cd('/tmp'):
+            result = self.conn.exec('pwd')
+
+        self.assertEqual(result.cmd, 'cd /tmp && pwd')
+        self.assertEqual(self.conn._cwd, '')
+
+    def test_exec_timeout_closes_socket_and_reports_partial_output(
+        self,
+    ) -> None:
+        """
+        Test a command timeout closes its socket and reports partial output.
+
+        :return: None.
+        """
+        self.conn = self.create_connected_connection()
+        socket = MagicMock()
+        self.client.api.exec_create.return_value = {'Id': 'exec-id'}
+        self.client.api.exec_start.return_value = socket
+
+        with (
+            patch(
+                'xbot.plugins.docker.docker.select',
+                return_value=([], [], []),
+            ),
+            patch(
+                'xbot.plugins.docker.docker.time.monotonic',
+                side_effect=(0.0, 0.0, 1.0),
+            ),
+            self.assertRaisesRegex(TimeoutError, "Command 'sleep 1' timedout"),
+        ):
+            self.conn.exec('sleep 1', timeout=0.5)
+
+        socket.close.assert_called_once_with()
+
+    def test_exec_reads_socket_io_objects(self) -> None:
+        """
+        Test command execution reads socket-like objects without recv.
+
+        :return: None.
+        """
+        self.conn = self.create_connected_connection()
+        socket = MagicMock(spec=['read', 'close'])
+        socket.read.side_effect = [b'hello\n', b'']
+        self.client.api.exec_create.return_value = {'Id': 'exec-id'}
+        self.client.api.exec_start.return_value = socket
+        self.client.api.exec_inspect.return_value = {'ExitCode': 0}
+        self.select.return_value = ([socket], [], [])
+
+        result = self.conn.exec('echo hello')
+
+        self.assertEqual(result, 'hello')
+        socket.read.assert_called()
+
+    def test_image_connection_creates_without_pull_or_status_check(
+        self,
+    ) -> None:
         """
         Test image target creates a temporary container directly.
 
@@ -231,7 +400,9 @@ class TestDockerConnection(unittest.TestCase):
         self.client.containers.get.assert_not_called()
         self.assertEqual(runargs, {'command': 'sleep 60'})
 
-    def test_existing_container_disconnect_does_not_mutate_lifecycle(self) -> None:
+    def test_existing_container_disconnect_does_not_mutate_lifecycle(
+        self,
+    ) -> None:
         """
         Test caller-owned container lifecycle remains unchanged.
 

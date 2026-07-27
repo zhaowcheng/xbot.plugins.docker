@@ -2,8 +2,12 @@
 Docker module.
 """
 
+import shlex
 import threading
-from typing import cast
+import time
+from contextlib import contextmanager
+from select import select
+from typing import Generator, cast
 
 from docker import DockerClient
 from docker.errors import DockerException
@@ -11,7 +15,7 @@ from docker.models.containers import Container
 from docker.tls import TLSConfig
 
 from xbot.framework.logger import ExtraAdapter, getlogger
-from xbot.plugins.docker.errors import DockerConnectError
+from xbot.plugins.docker.errors import DockerCommandError, DockerConnectError
 from xbot.plugins.docker.utils import (
     remove_ansi_escape_chars,
     remove_unprintable_chars,
@@ -301,3 +305,116 @@ class DockerConnection:
             self._gid = None
         if removal_error is not None:
             raise removal_error
+
+    def exec(
+        self,
+        cmd: str,
+        expect: int | str | None = 0,
+        timeout: int | float = 15,
+        shenvs: dict[str, str] | None = None,
+    ) -> DockerCommandResult:
+        """
+        Execute a command in the connected container.
+
+        :param cmd: Command to execute.
+        :param expect: Expected return code, output text, or None to skip
+            checks.
+        :param timeout: Command timeout in seconds.
+        :param shenvs: Per-command shell environment variables.
+        :return: Command output and metadata.
+        :raises DockerCommandError: If the command result does not match expect.
+        :raises TimeoutError: If the command does not finish before timeout.
+        """
+        effective_cmd = cmd
+        if self._cwd:
+            effective_cmd = f'cd {shlex.quote(self._cwd)} && {cmd}'
+        extra = {'hook': {}}
+        self._logger.info(
+            f"Command: '{effective_cmd}', Expect: '{expect}'",
+            extra=extra,
+        )
+        environment = {
+            'LANG': 'C.UTF-8',
+            'LANGUAGE': 'en_US.UTF-8',
+        }
+        environment.update(self._shenvs)
+        environment.update(shenvs or {})
+        exec_info = self._client().api.exec_create(
+            self._container_resource().id,
+            ['/bin/sh', '-c', effective_cmd],
+            stdout=True,
+            stderr=True,
+            stdin=False,
+            tty=True,
+            environment=environment,
+            user=self._user,
+        )
+        exec_id = exec_info['Id']
+        socket = self._client().api.exec_start(
+            exec_id,
+            tty=True,
+            socket=True,
+        )
+        encoding = environment['LANG'].rpartition('.')[2] or 'utf-8'
+        output = ''
+        started = time.monotonic()
+        try:
+            while time.monotonic() - started <= timeout:
+                readable, _, _ = select([socket], [], [], 0.1)
+                if socket not in readable:
+                    continue
+                if hasattr(socket, 'recv'):
+                    data = socket.recv(1024)
+                else:
+                    data = socket.read(1024)
+                if not data:
+                    break
+                output += data.decode(encoding=encoding, errors='ignore')
+            else:
+                result = DockerCommandResult(
+                    output,
+                    rc=-1,
+                    cmd=effective_cmd,
+                )
+                extra['hook']['more'] = result
+                raise TimeoutError(
+                    f"Command '{effective_cmd}' timedout({timeout}s):\n{result}"
+                )
+        finally:
+            socket.close()
+
+        result = DockerCommandResult(
+            output,
+            rc=self._client().api.exec_inspect(exec_id)['ExitCode'],
+            cmd=effective_cmd,
+        )
+        extra['hook']['more'] = result
+        if expect is None:
+            return result
+        if isinstance(expect, int) and expect == result.rc:
+            return result
+        if isinstance(expect, str) and expect in result:
+            return result
+        raise DockerCommandError(
+            'Expectations not met:\n'
+            f'Command: {effective_cmd}\n'
+            f'Expect: {expect}\n'
+            f'ReturnCode: {result.rc}\n'
+            f'Output:\n{result}'
+        )
+
+    @contextmanager
+    def cd(self, path: str) -> Generator[None, None, None]:
+        """
+        Change the working directory for commands in the context.
+
+        :param path: Container working directory.
+        :return: Context manager iterator.
+        """
+        self._cdlock.acquire()
+        try:
+            self._cwd = path
+            yield
+        finally:
+            self._cwd = ''
+            self._cdlock.release()
