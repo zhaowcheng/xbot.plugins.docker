@@ -259,11 +259,19 @@ class DockerConnection:
                 target_source = 'container'
                 prefix_target = container
             else:
-                dockercontainer = dockerclient.containers.run(
+                dockercontainer = dockerclient.containers.create(
                     cast(str, image),
                     detach=True,
                     **(runargs or {}),
                 )
+                try:
+                    dockercontainer.start()
+                except DockerException:
+                    try:
+                        dockercontainer.remove(force=True)
+                    except DockerException:
+                        pass
+                    raise
                 temporary = True
                 target_source = 'image'
                 prefix_target = f'{image}->{dockercontainer.name}'

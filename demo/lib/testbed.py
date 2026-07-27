@@ -51,6 +51,15 @@ class TestBed(testbed.TestBed):
 
         :return: None.
         """
-        for conn in self._conns.values():
-            conn.disconnect()
-        self._conns.clear()
+        first_error: Exception | None = None
+        try:
+            for conn in self._conns.values():
+                try:
+                    conn.disconnect()
+                except Exception as error:
+                    if first_error is None:
+                        first_error = error
+        finally:
+            self._conns.clear()
+        if first_error is not None:
+            raise first_error

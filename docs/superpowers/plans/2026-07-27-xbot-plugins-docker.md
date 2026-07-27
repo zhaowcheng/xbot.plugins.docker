@@ -492,7 +492,7 @@ def test_disconnect_removes_only_image_container(self) -> None:
         image='alpine:latest',
         runargs={'command': 'sleep 60'},
     )
-    created = self.client.containers.run.return_value
+    created = self.client.containers.create.return_value
 
     self.conn.disconnect()
 
@@ -501,7 +501,7 @@ def test_disconnect_removes_only_image_container(self) -> None:
 ```
 
 Use `unittest.mock.patch('xbot.plugins.docker.docker.DockerClient')` in
-`setUp()` and configure `containers.get()` and `containers.run()` return
+`setUp()` and configure `containers.get()` and `containers.create()` return
 objects with explicit `status`, `name`, and `id` values.
 
 Also test:
@@ -578,8 +578,10 @@ Use truth-value pairing for certificate paths:
 canonical test command behave as omitted values.
 Call `containers.get(container)` for existing targets and reject any status
 other than `running`. Call
-`containers.run(image, detach=True, **(runargs or {}))` for image targets
-without checking the resulting status.
+`containers.create(image, detach=True, **(runargs or {}))` for image targets,
+save the returned container, and call `start()` without checking the resulting
+status. If `start()` fails, force-remove the created container before closing
+the client and reporting the connection error. Never pull a missing image.
 
 Catch Docker SDK connection, lookup, TLS, and create failures, close the
 newly created client, and raise `DockerConnectError(str(error)) from None`.

@@ -19,6 +19,7 @@ from docker.errors import DockerException, NotFound
 from docker.models.containers import Container
 from docker.tls import TLSConfig
 
+from demo.lib.testbed import TestBed as DemoTestBed
 from xbot.plugins.docker import docker
 from xbot.plugins.docker.docker import DockerCommandResult, DockerConnection
 from xbot.plugins.docker.errors import DockerCommandError, DockerConnectError
@@ -147,7 +148,7 @@ class TestDockerConnection(unittest.TestCase):
         existing.name = 'existing'
         existing.id = 'existing-id'
         self.container = existing
-        created = self.client.containers.run.return_value
+        created = self.client.containers.create.return_value
         created.status = 'running'
         created.name = 'created-container'
         created.id = 'created-id'
@@ -256,10 +257,11 @@ class TestDockerConnection(unittest.TestCase):
             image='alpine:latest',
             runargs={'command': 'sleep 60'},
         )
-        created = self.client.containers.run.return_value
+        created = self.client.containers.create.return_value
 
         self.conn.disconnect()
 
+        created.start.assert_called_once_with()
         created.remove.assert_called_once_with(force=True)
         self.client.close.assert_called_once_with()
 
@@ -274,7 +276,7 @@ class TestDockerConnection(unittest.TestCase):
 
         self.client_class.assert_called_once()
         self.client.containers.get.assert_called_once_with('existing')
-        self.client.containers.run.assert_not_called()
+        self.client.containers.create.assert_not_called()
 
     def test_unopened_accessors_raise_connect_error(self) -> None:
         """
@@ -780,11 +782,13 @@ class TestDockerConnection(unittest.TestCase):
 
         self.conn.connect('127.0.0.1', image='alpine:latest', runargs=runargs)
 
-        self.client.containers.run.assert_called_once_with(
+        self.client.containers.create.assert_called_once_with(
             'alpine:latest',
             detach=True,
             command='sleep 60',
         )
+        created = self.client.containers.create.return_value
+        created.start.assert_called_once_with()
         self.client.images.pull.assert_not_called()
         self.client.containers.get.assert_not_called()
         self.assertEqual(runargs, {'command': 'sleep 60'})
@@ -825,11 +829,43 @@ class TestDockerConnection(unittest.TestCase):
 
         :return: None.
         """
-        self.client.containers.run.side_effect = DockerException('create failed')
+        self.client.containers.create.side_effect = DockerException(
+            'create failed'
+        )
 
         with self.assertRaisesRegex(DockerConnectError, 'create failed'):
             self.conn.connect('127.0.0.1', image='alpine:latest')
 
+        self.client.close.assert_called_once_with()
+
+    def test_missing_image_is_reported_without_pull(self) -> None:
+        """
+        Test a missing image is reported without an implicit image pull.
+
+        :return: None.
+        """
+        self.client.containers.create.side_effect = NotFound('image missing')
+
+        with self.assertRaisesRegex(DockerConnectError, 'image missing'):
+            self.conn.connect('127.0.0.1', image='missing:latest')
+
+        self.client.images.pull.assert_not_called()
+        self.client.close.assert_called_once_with()
+
+    def test_start_error_removes_created_container(self) -> None:
+        """
+        Test a start failure removes the already-created container.
+
+        :return: None.
+        """
+        created = self.client.containers.create.return_value
+        created.start.side_effect = DockerException('start failed')
+        created.remove.side_effect = DockerException('remove failed')
+
+        with self.assertRaisesRegex(DockerConnectError, 'start failed'):
+            self.conn.connect('127.0.0.1', image='alpine:latest')
+
+        created.remove.assert_called_once_with(force=True)
         self.client.close.assert_called_once_with()
 
     def test_removal_error_is_reraised_after_client_close(self) -> None:
@@ -839,7 +875,7 @@ class TestDockerConnection(unittest.TestCase):
         :return: None.
         """
         self.conn.connect('127.0.0.1', image='alpine:latest')
-        created = self.client.containers.run.return_value
+        created = self.client.containers.create.return_value
         removal_error = DockerException('remove failed')
         created.remove.side_effect = removal_error
 
@@ -868,6 +904,39 @@ class TestDockerConnection(unittest.TestCase):
             self.conn._logger.extra['prefix'],
             'docker://root@127.0.0.1:2375/alpine:latest->created-container',
         )
+
+
+class TestDemoTestBed(unittest.TestCase):
+    """
+    Test the demo TestBed lifecycle.
+    """
+
+    def test_disconnect_continues_after_connection_error(self) -> None:
+        """
+        Test disconnect cleans every cached connection after an error.
+
+        :return: None.
+        """
+        testbed = object.__new__(DemoTestBed)
+        first = MagicMock(spec=DockerConnection)
+        second = MagicMock(spec=DockerConnection)
+        first_error = DockerException('first disconnect failed')
+        first.disconnect.side_effect = first_error
+        second.disconnect.side_effect = DockerException(
+            'second disconnect failed'
+        )
+        testbed._conns = {
+            'first': first,
+            'second': second,
+        }
+
+        with self.assertRaises(DockerException) as caught:
+            testbed.disconnect()
+
+        self.assertIs(caught.exception, first_error)
+        first.disconnect.assert_called_once_with()
+        second.disconnect.assert_called_once_with()
+        self.assertEqual(testbed._conns, {})
 
 
 class TestDockerRunner(unittest.TestCase):

@@ -84,7 +84,7 @@ connect(
 - `image` 是用于创建临时容器的镜像名称或 ID；
 - `container` 与 `image` 必须且只能指定一个；
 - `user` 是容器内执行命令的用户，不是 Docker daemon 用户；
-- `runargs` 原样传给 `DockerClient.containers.run()`；
+- `runargs` 原样传给 `DockerClient.containers.create()`；
 - `timeout` 是 Docker client API 请求超时；
 - `cacert`、`clientcert` 和 `clientkey` 用于 TLS；
 - `clientcert` 与 `clientkey` 必须成对指定。
@@ -100,10 +100,11 @@ connect(
 `running`，则关闭 Docker client 并抛出 `DockerConnectError`。库不启动
 已有容器，也不改变其生命周期。
 
-镜像模式调用
-`containers.run(image, detach=True, **runargs)`。库不检查创建后的容器
-是否仍在运行，也不覆盖镜像的 `ENTRYPOINT` 或 `CMD`。需要常驻进程时，
-调用者通过 `runargs['command']` 指定。
+镜像模式调用 `containers.create(image, detach=True, **runargs)`，保存返回
+的容器句柄后再调用 `start()`。这样镜像缺失时不会隐式拉取镜像，并能在
+启动失败时强制删除已经创建的容器。库不检查启动后的容器是否仍在运行，
+也不覆盖镜像的 `ENTRYPOINT` 或 `CMD`。需要常驻进程时，调用者通过
+`runargs['command']` 指定。
 
 同一连接已建立时，重复调用 `connect()` 直接返回。
 
