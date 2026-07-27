@@ -292,9 +292,11 @@ docker://root@192.168.8.8:2375/alpine:latest->created-container
 
 README 不增加测试、开发、构建或内部设计章节。
 
-`demo/` 对齐 SSH 项目的 TestBed、TestCase、testbed、testset 和 testcase
-布局。TestBed 缓存 `DockerConnection`，示例展示命令执行和文件传输，
-并在 teardown 中断开连接和清理本地测试数据。
+`demo/` 必须先通过 `xbot init -d demo` 初始化标准 xbot 项目，再基于
+生成结果添加 Docker TestBed、TestCase、testbed、testset 和 testcase，
+不能从空目录手工搭建。删除初始化产生的通用示例，保留标准项目外围文件。
+TestBed 缓存 `DockerConnection`，示例展示命令执行和文件传输，并在
+teardown 中断开连接和清理本地测试数据。
 
 ## 打包
 
