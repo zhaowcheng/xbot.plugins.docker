@@ -21,7 +21,7 @@ class tc_eg_nonpass_timeout(TestCase):
         """
         Test step 1.
         """
-        # This will be forced to end due to timeout, subsequent 
+        # This will be forced to end due to timeout, subsequent
         # steps will be skipped and immediately execute teardown.
         self.sleep(3)
 

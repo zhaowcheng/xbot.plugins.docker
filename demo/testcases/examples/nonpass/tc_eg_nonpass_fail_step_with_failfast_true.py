@@ -21,7 +21,7 @@ class tc_eg_nonpass_fail_step_with_failfast_true(TestCase):
         """
         Assert 1 == 2
         """
-        # This will fail, and due to FAILFAST=True, it will skip the 
+        # This will fail, and due to FAILFAST=True, it will skip the
         # subsequent test steps and immediately execute teardown.
         assertx(1, '==', 2)
 

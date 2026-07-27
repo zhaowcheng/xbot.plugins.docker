@@ -19,7 +19,7 @@ class tc_eg_nonpass_fail_step_with_failfast_false(TestCase):
         """
         Assert 1 == 2.
         """
-        # This will fail, but since FAILFAST is set to False, 
+        # This will fail, but since FAILFAST is set to False,
         # it will continue executing subsequent test steps.
         assertx(1, '==', 2)
 

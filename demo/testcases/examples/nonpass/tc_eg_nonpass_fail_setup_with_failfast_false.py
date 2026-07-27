@@ -13,7 +13,7 @@ class tc_eg_nonpass_fail_setup_with_failfast_false(TestCase):
         """
         Prepare test environment.
         """
-        # When the setup fails, regardless of the value of FAILFAST, 
+        # When the setup fails, regardless of the value of FAILFAST,
         # subsequent steps will be skipped and immediately execute teardown.
         assertx(1, '==', 0)
 
