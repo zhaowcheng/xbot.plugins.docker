@@ -4,13 +4,17 @@ Test Docker module helpers.
 
 import doctest
 import io
+import shutil
 import tarfile
 import tempfile
 import unittest
+import uuid
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
-from docker.errors import DockerException
+from docker import DockerClient
+from docker.errors import DockerException, NotFound
+from docker.tls import TLSConfig
 
 from xbot.plugins.docker import docker
 from xbot.plugins.docker.docker import DockerCommandResult, DockerConnection
@@ -23,6 +27,30 @@ IMAGE = ''
 CACERT = ''
 CLIENTCERT = ''
 CLIENTKEY = ''
+
+
+def create_docker_client() -> DockerClient:
+    """
+    Create a real client using the configured Docker endpoint.
+
+    :return: Docker client.
+    """
+    tls: TLSConfig | bool = False
+    if CACERT or CLIENTCERT:
+        tls = TLSConfig(
+            ca_cert=CACERT,
+            verify=bool(CACERT),
+            client_cert=(
+                (CLIENTCERT, CLIENTKEY)
+                if CLIENTCERT and CLIENTKEY
+                else None
+            ),
+        )
+    return DockerClient(
+        base_url=f'tcp://{HOST}:{PORT}',
+        tls=tls,
+        timeout=5,
+    )
 
 
 def load_tests(
@@ -487,6 +515,30 @@ class TestDockerConnection(unittest.TestCase):
             ):
                 self.conn.getfile('/tmp/source', directory)
 
+    def test_transfer_helpers_propagate_unopened_connection_error(
+        self,
+    ) -> None:
+        """
+        Test transfer and path helpers preserve the public connection error.
+
+        :return: None.
+        """
+        calls = (
+            (self.conn.getdir, ('/tmp/tree', '/tmp')),
+            (self.conn.putfile, ('/tmp/source', '/tmp')),
+            (self.conn.putdir, ('/tmp/tree', '/tmp')),
+            (self.conn.exists, ('/tmp/source',)),
+            (self.conn.makedirs, ('/tmp/tree',)),
+        )
+
+        for method, args in calls:
+            with self.subTest(method=method.__name__):
+                with self.assertRaisesRegex(
+                    DockerConnectError,
+                    r'^Docker connection is not open\.$',
+                ):
+                    method(*args)
+
     def test_getfile_requires_existing_local_destination(self) -> None:
         """
         Test getfile does not create a missing local destination directory.
@@ -794,4 +846,266 @@ class TestDockerConnection(unittest.TestCase):
         self.assertEqual(
             self.conn._logger.extra['prefix'],
             'docker://root@127.0.0.1:2375/alpine:latest->created-container',
+        )
+
+
+class TestDockerIntegration(unittest.TestCase):
+    """
+    Test Docker operations against a real remote daemon.
+    """
+
+    client: DockerClient
+    fixture_name: str
+    fixture: object
+    local_root: Path
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        """
+        Create the real Docker client and owned test fixtures.
+
+        :return: None.
+        """
+        if not HOST or not IMAGE:
+            raise unittest.SkipTest('Real Docker endpoint is not configured.')
+
+        cls.client = create_docker_client()
+        cls.fixture_name = (
+            f'xbot-plugins-docker-test-{uuid.uuid4().hex[:8]}'
+        )
+        try:
+            cls.fixture = cls.client.containers.run(
+                IMAGE,
+                command=['/bin/sh', '-c', 'while :; do sleep 60; done'],
+                detach=True,
+                name=cls.fixture_name,
+            )
+            cls.local_root = Path(
+                tempfile.mkdtemp(prefix='xbot-docker-test-')
+            )
+        except Exception:
+            fixture = getattr(cls, 'fixture', None)
+            try:
+                if fixture is not None:
+                    fixture.remove(force=True)
+            finally:
+                cls.client.close()
+            raise
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        """
+        Remove every class fixture and close the raw Docker client.
+
+        :return: None.
+        """
+        try:
+            try:
+                cls.fixture.remove(force=True)
+            except NotFound:
+                pass
+        finally:
+            try:
+                shutil.rmtree(cls.local_root, ignore_errors=True)
+            finally:
+                cls.client.close()
+
+    def remove_remote_root(
+        self,
+        conn: DockerConnection,
+        remote_root: str,
+    ) -> None:
+        """
+        Remove and verify one owned remote test directory.
+
+        :param conn: Open Docker connection.
+        :param remote_root: Owned remote test directory.
+        :return: None.
+        """
+        conn.exec(f'rm -rf -- {remote_root}')
+        self.assertFalse(conn.exists(remote_root))
+
+    def test_image_connection_commands_and_lifecycle(self) -> None:
+        """
+        Test commands and cleanup for an image-created container.
+
+        :return: None.
+        """
+        container_name = (
+            f'xbot-plugins-docker-test-image-{uuid.uuid4().hex[:8]}'
+        )
+        conn = DockerConnection()
+        conn.connect(
+            HOST,
+            port=PORT,
+            image=IMAGE,
+            runargs={
+                'command': ['/bin/sh', '-c', 'while :; do sleep 60; done'],
+                'name': container_name,
+            },
+            cacert=CACERT,
+            clientcert=CLIENTCERT,
+            clientkey=CLIENTKEY,
+        )
+        try:
+            saved_id = self.client.containers.get(container_name).id
+            result = conn.exec('printf command-ok')
+            self.assertIsInstance(result, DockerCommandResult)
+            self.assertEqual(result, 'command-ok')
+            self.assertEqual(result.rc, 0)
+            self.assertEqual(result.cmd, 'printf command-ok')
+            self.assertEqual(conn.exec('exit 7', expect=7).rc, 7)
+            self.assertEqual(
+                conn.exec('printf string-ok', expect='string-ok'),
+                'string-ok',
+            )
+            self.assertEqual(conn.exec('exit 9', expect=None).rc, 9)
+            self.assertEqual(
+                conn.exec(
+                    'printf "$XBOT_DOCKER_VALUE"',
+                    shenvs={'XBOT_DOCKER_VALUE': 'environment-ok'},
+                ),
+                'environment-ok',
+            )
+            with conn.cd('/tmp'):
+                self.assertEqual(conn.exec('pwd'), '/tmp')
+            with self.assertRaises(TimeoutError):
+                conn.exec('sleep 2', timeout=1)
+        finally:
+            conn.disconnect()
+
+        with self.assertRaises(NotFound):
+            self.client.containers.get(saved_id)
+
+    def test_existing_container_commands_and_lifecycle(self) -> None:
+        """
+        Test commands do not change a caller-owned container lifecycle.
+
+        :return: None.
+        """
+        remote_root = (
+            f'/tmp/xbot-plugins-docker-test-existing-'
+            f'{uuid.uuid4().hex[:8]}'
+        )
+        conn = DockerConnection()
+        conn.connect(
+            HOST,
+            port=PORT,
+            container=self.fixture_name,
+            cacert=CACERT,
+            clientcert=CLIENTCERT,
+            clientkey=CLIENTKEY,
+        )
+        try:
+            self.assertEqual(conn.exec('echo existing-ok'), 'existing-ok')
+            self.assertFalse(conn.exists(remote_root))
+            conn.makedirs(remote_root)
+            self.assertTrue(conn.exists(remote_root))
+        finally:
+            try:
+                self.remove_remote_root(conn, remote_root)
+            finally:
+                conn.disconnect()
+
+        fixture = self.client.containers.get(self.fixture_name)
+        fixture.reload()
+        self.assertEqual(fixture.status, 'running')
+
+    def test_stopped_container_is_rejected(self) -> None:
+        """
+        Test a real non-running container is rejected and removed.
+
+        :return: None.
+        """
+        stopped_name = (
+            f'xbot-plugins-docker-test-stopped-{uuid.uuid4().hex[:8]}'
+        )
+        stopped = self.client.containers.create(
+            IMAGE,
+            command=['/bin/sh', '-c', 'exit 0'],
+            name=stopped_name,
+        )
+        try:
+            conn = DockerConnection()
+            with self.assertRaises(DockerConnectError):
+                conn.connect(
+                    HOST,
+                    port=PORT,
+                    container=stopped.name,
+                    cacert=CACERT,
+                    clientcert=CLIENTCERT,
+                    clientkey=CLIENTKEY,
+                )
+        finally:
+            stopped.remove(force=True)
+
+    def test_file_and_directory_transfers(self) -> None:
+        """
+        Test real uploads and downloads with original and renamed paths.
+
+        :return: None.
+        """
+        case_name = uuid.uuid4().hex[:8]
+        local = self.local_root / case_name
+        source = local / 'file'
+        tree = local / 'tree'
+        nested = tree / 'nested'
+        download = local / 'download'
+        nested.mkdir(parents=True)
+        download.mkdir()
+        source.write_text('file-content', encoding='utf-8')
+        (tree / 'root.txt').write_text('root-content', encoding='utf-8')
+        (nested / 'child.txt').write_text(
+            'nested-content',
+            encoding='utf-8',
+        )
+        remote_root = f'/tmp/xbot-plugins-docker-test-{case_name}'
+
+        conn = DockerConnection()
+        conn.connect(
+            HOST,
+            port=PORT,
+            container=self.fixture_name,
+            cacert=CACERT,
+            clientcert=CLIENTCERT,
+            clientkey=CLIENTKEY,
+        )
+        self.addCleanup(conn.disconnect)
+        self.addCleanup(self.remove_remote_root, conn, remote_root)
+
+        conn.putfile(str(source), remote_root)
+        self.assertEqual(
+            conn.exec(f'cat {remote_root}/file'),
+            'file-content',
+        )
+        conn.putfile(str(source), remote_root, filename='renamed')
+        self.assertEqual(
+            conn.exec(f'cat {remote_root}/renamed'),
+            'file-content',
+        )
+        conn.putdir(str(tree), remote_root)
+        self.assertEqual(
+            conn.exec(f'cat {remote_root}/tree/nested/child.txt'),
+            'nested-content',
+        )
+        conn.getfile(
+            f'{remote_root}/file',
+            str(download),
+            filename='renamed',
+        )
+        conn.getdir(f'{remote_root}/tree', str(download))
+
+        self.assertEqual(
+            (download / 'renamed').read_text(encoding='utf-8'),
+            'file-content',
+        )
+        self.assertEqual(
+            (download / 'tree' / 'root.txt').read_text(encoding='utf-8'),
+            'root-content',
+        )
+        self.assertEqual(
+            (
+                download / 'tree' / 'nested' / 'child.txt'
+            ).read_text(encoding='utf-8'),
+            'nested-content',
         )

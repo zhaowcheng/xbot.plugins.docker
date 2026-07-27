@@ -20,9 +20,9 @@ def create_parser() -> argparse.ArgumentParser:
     parser.add_argument('-H', '--host', required=True)
     parser.add_argument('-P', '--port', type=int, default=2375)
     parser.add_argument('-i', '--image', required=True)
-    parser.add_argument('--cacert')
-    parser.add_argument('--clientcert')
-    parser.add_argument('--clientkey')
+    parser.add_argument('--cacert', default='')
+    parser.add_argument('--clientcert', default='')
+    parser.add_argument('--clientkey', default='')
     return parser
 
 
