@@ -3,6 +3,7 @@ Test Docker module helpers.
 """
 
 import doctest
+import importlib.util
 import io
 import shutil
 import tarfile
@@ -10,6 +11,7 @@ import tempfile
 import unittest
 import uuid
 from pathlib import Path
+from types import ModuleType
 from unittest.mock import MagicMock, patch
 
 from docker import DockerClient
@@ -27,6 +29,24 @@ IMAGE = ''
 CACERT = ''
 CLIENTCERT = ''
 CLIENTKEY = ''
+
+
+def load_runner_module() -> ModuleType:
+    """
+    Load the test runner without executing its command-line entry point.
+
+    :return: Loaded test runner module.
+    """
+    runner_path = Path(__file__).with_name('run.py')
+    spec = importlib.util.spec_from_file_location(
+        'xbot_plugins_docker_test_runner',
+        runner_path,
+    )
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f'Cannot load test runner: {runner_path}')
+    runner = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(runner)
+    return runner
 
 
 def create_docker_client() -> DockerClient:
@@ -511,7 +531,7 @@ class TestDockerConnection(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             with self.assertRaisesRegex(
                 DockerConnectError,
-                'Docker connection is not open.',
+                r'^Docker connection is not open\.$',
             ):
                 self.conn.getfile('/tmp/source', directory)
 
@@ -849,6 +869,49 @@ class TestDockerConnection(unittest.TestCase):
         )
 
 
+class TestDockerRunner(unittest.TestCase):
+    """
+    Test real-integration runner configuration failures.
+    """
+
+    def test_empty_endpoint_values_are_rejected(self) -> None:
+        """
+        Test present but empty endpoint options fail argument parsing.
+
+        :return: None.
+        """
+        parser = load_runner_module().create_parser()
+        arguments = (
+            ('-H', '', '-i', 'rockylinux:9'),
+            ('-H', '127.0.0.1', '-i', ''),
+        )
+
+        for args in arguments:
+            with self.subTest(args=args):
+                with (
+                    patch('sys.stderr', new=io.StringIO()),
+                    self.assertRaises(SystemExit) as caught,
+                ):
+                    parser.parse_args(args)
+                self.assertEqual(caught.exception.code, 2)
+
+    def test_missing_integration_configuration_is_an_error(self) -> None:
+        """
+        Test a missing endpoint cannot silently skip real integration.
+
+        :return: None.
+        """
+        with (
+            patch(f'{__name__}.HOST', ''),
+            patch(f'{__name__}.IMAGE', ''),
+            self.assertRaisesRegex(
+                RuntimeError,
+                r'^Real Docker endpoint is not configured\.$',
+            ),
+        ):
+            TestDockerIntegration.setUpClass()
+
+
 class TestDockerIntegration(unittest.TestCase):
     """
     Test Docker operations against a real remote daemon.
@@ -867,7 +930,7 @@ class TestDockerIntegration(unittest.TestCase):
         :return: None.
         """
         if not HOST or not IMAGE:
-            raise unittest.SkipTest('Real Docker endpoint is not configured.')
+            raise RuntimeError('Real Docker endpoint is not configured.')
 
         cls.client = create_docker_client()
         cls.fixture_name = (
@@ -925,6 +988,19 @@ class TestDockerIntegration(unittest.TestCase):
         conn.exec(f'rm -rf -- {remote_root}')
         self.assertFalse(conn.exists(remote_root))
 
+    def remove_owned_container(self, container_name: str) -> None:
+        """
+        Remove an owned test container if the tested cleanup left it behind.
+
+        :param container_name: Unique owned test container name.
+        :return: None.
+        """
+        try:
+            container = self.client.containers.get(container_name)
+        except NotFound:
+            return
+        container.remove(force=True)
+
     def test_image_connection_commands_and_lifecycle(self) -> None:
         """
         Test commands and cleanup for an image-created container.
@@ -935,6 +1011,7 @@ class TestDockerIntegration(unittest.TestCase):
             f'xbot-plugins-docker-test-image-{uuid.uuid4().hex[:8]}'
         )
         conn = DockerConnection()
+        self.addCleanup(self.remove_owned_container, container_name)
         conn.connect(
             HOST,
             port=PORT,
@@ -1025,8 +1102,8 @@ class TestDockerIntegration(unittest.TestCase):
             command=['/bin/sh', '-c', 'exit 0'],
             name=stopped_name,
         )
+        conn = DockerConnection()
         try:
-            conn = DockerConnection()
             with self.assertRaises(DockerConnectError):
                 conn.connect(
                     HOST,
@@ -1037,7 +1114,10 @@ class TestDockerIntegration(unittest.TestCase):
                     clientkey=CLIENTKEY,
                 )
         finally:
-            stopped.remove(force=True)
+            try:
+                conn.disconnect()
+            finally:
+                stopped.remove(force=True)
 
     def test_file_and_directory_transfers(self) -> None:
         """

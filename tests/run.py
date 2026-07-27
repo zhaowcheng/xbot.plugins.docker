@@ -10,6 +10,18 @@ from pathlib import Path
 import test_docker
 
 
+def non_empty(value: str) -> str:
+    """
+    Reject an empty command-line value.
+
+    :param value: Command-line value.
+    :return: Non-empty command-line value.
+    """
+    if not value:
+        raise argparse.ArgumentTypeError('must not be empty')
+    return value
+
+
 def create_parser() -> argparse.ArgumentParser:
     """
     Create the test argument parser.
@@ -17,9 +29,9 @@ def create_parser() -> argparse.ArgumentParser:
     :return: Argument parser.
     """
     parser = argparse.ArgumentParser()
-    parser.add_argument('-H', '--host', required=True)
+    parser.add_argument('-H', '--host', required=True, type=non_empty)
     parser.add_argument('-P', '--port', type=int, default=2375)
-    parser.add_argument('-i', '--image', required=True)
+    parser.add_argument('-i', '--image', required=True, type=non_empty)
     parser.add_argument('--cacert', default='')
     parser.add_argument('--clientcert', default='')
     parser.add_argument('--clientkey', default='')
