@@ -1,0 +1,21 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# IDE config files
+.vscode/*
+.idea/*
+
+# logs
+logs/*
+
+# testbeds
+testbeds/*
+!testbeds/testbed_example.yml
+!testbeds/mytestbed.yml
+
+# testsets
+testsets/*
+!testsets/testset_example.yml
+!testsets/mytestset.yml
