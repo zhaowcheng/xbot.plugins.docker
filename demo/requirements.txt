@@ -1,2 +1,2 @@
-xbot.framework; python_version >= '3.10'
+xbot.framework>=1,<2; python_version >= '3.10'
 xbot.plugins.docker

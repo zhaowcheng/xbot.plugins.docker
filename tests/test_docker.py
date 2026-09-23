@@ -141,8 +141,6 @@ class TestDockerConnection(unittest.TestCase):
         self.client_patch = patch('xbot.plugins.docker.docker.DockerClient')
         self.client_class = self.client_patch.start()
         self.client = self.client_class.return_value
-        self.select_patch = patch('xbot.plugins.docker.docker.select')
-        self.select = self.select_patch.start()
         existing = self.client.containers.get.return_value
         existing.status = 'running'
         existing.name = 'existing'
@@ -161,7 +159,6 @@ class TestDockerConnection(unittest.TestCase):
         :return: None.
         """
         self.client_patch.stop()
-        self.select_patch.stop()
 
     def create_connected_connection(
         self,
@@ -196,7 +193,6 @@ class TestDockerConnection(unittest.TestCase):
         self.client.api.exec_create.return_value = {'Id': 'exec-id'}
         self.client.api.exec_start.return_value = socket
         self.client.api.exec_inspect.return_value = {'ExitCode': rc}
-        self.select.return_value = ([socket], [], [])
         return socket
 
     def test_connect_requires_exactly_one_target(self) -> None:
@@ -733,23 +729,35 @@ class TestDockerConnection(unittest.TestCase):
         """
         self.conn = self.create_connected_connection()
         socket = MagicMock()
+        socket.recv.side_effect = TimeoutError
         self.client.api.exec_create.return_value = {'Id': 'exec-id'}
         self.client.api.exec_start.return_value = socket
 
         with (
-            patch(
-                'xbot.plugins.docker.docker.select',
-                return_value=([], [], []),
-            ),
-            patch(
-                'xbot.plugins.docker.docker.time.monotonic',
-                side_effect=(0.0, 0.0, 1.0),
-            ),
             self.assertRaisesRegex(TimeoutError, "Command 'sleep 1' timedout"),
         ):
             self.conn.exec('sleep 1', timeout=0.5)
 
         socket.close.assert_called_once_with()
+
+    def test_exec_reads_buffered_output_before_socket_readiness(
+        self,
+    ) -> None:
+        """
+        Test buffered output is read without waiting on the raw socket.
+
+        :return: None.
+        """
+        self.conn = self.create_connected_connection()
+        socket = MagicMock(spec=['read', 'close'])
+        socket.read.side_effect = [b'hello\n', b'']
+        self.client.api.exec_create.return_value = {'Id': 'exec-id'}
+        self.client.api.exec_start.return_value = socket
+        self.client.api.exec_inspect.return_value = {'ExitCode': 0}
+
+        result = self.conn.exec('echo hello', timeout=0.01)
+
+        self.assertEqual(result, 'hello')
 
     def test_exec_reads_socket_io_objects(self) -> None:
         """
@@ -763,7 +771,6 @@ class TestDockerConnection(unittest.TestCase):
         self.client.api.exec_create.return_value = {'Id': 'exec-id'}
         self.client.api.exec_start.return_value = socket
         self.client.api.exec_inspect.return_value = {'ExitCode': 0}
-        self.select.return_value = ([socket], [], [])
 
         result = self.conn.exec('echo hello')
 

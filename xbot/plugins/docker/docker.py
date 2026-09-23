@@ -10,7 +10,6 @@ import tarfile
 import threading
 import time
 from contextlib import contextmanager
-from select import select
 from typing import Generator, cast
 
 from docker import DockerClient
@@ -373,19 +372,29 @@ class DockerConnection:
         encoding = environment['LANG'].rpartition('.')[2] or 'utf-8'
         output = ''
         started = time.monotonic()
+        timed_out = False
         try:
-            while time.monotonic() - started <= timeout:
-                readable, _, _ = select([socket], [], [], 0.1)
-                if socket not in readable:
-                    continue
-                if hasattr(socket, 'recv'):
-                    data = socket.recv(1024)
-                else:
-                    data = socket.read(1024)
+            while True:
+                remaining = timeout - (time.monotonic() - started)
+                if remaining <= 0:
+                    timed_out = True
+                    break
+                raw_socket = getattr(socket, '_sock', socket)
+                settimeout = getattr(raw_socket, 'settimeout', None)
+                if settimeout is not None:
+                    settimeout(remaining)
+                try:
+                    if hasattr(socket, 'recv'):
+                        data = socket.recv(1024)
+                    else:
+                        data = socket.read(1024)
+                except TimeoutError:
+                    timed_out = True
+                    break
                 if not data:
                     break
                 output += data.decode(encoding=encoding, errors='ignore')
-            else:
+            if timed_out:
                 result = DockerCommandResult(
                     output,
                     rc=-1,

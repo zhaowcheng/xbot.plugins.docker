@@ -4,10 +4,10 @@ import tempfile
 
 from xbot.framework.utils import assertx
 
-from lib.testcase import TestCase
+from . import tc
 
 
-class tc_docker(TestCase):
+class tc_docker(tc):
     """
     Test Docker plugin operations.
     """

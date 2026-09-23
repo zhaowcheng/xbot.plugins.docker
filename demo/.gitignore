@@ -19,3 +19,7 @@ testbeds/*
 testsets/*
 !testsets/testset_example.yml
 !testsets/mytestset.yml
+
+# venv
+venv/
+.venv/

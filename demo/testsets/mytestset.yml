@@ -1,5 +1,7 @@
 tags:
   include:
   exclude:
-paths:
-  - testcases/tc_docker.py
+testcases:
+  install:
+  test:
+    - testcases/tc_docker.py
